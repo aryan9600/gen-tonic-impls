@@ -1,4 +1,5 @@
 mod ident;
+pub mod client;
 
 use heck::SnakeCase;
 use ident::{to_snake, to_upper_camel};
@@ -12,7 +13,7 @@ use quote::quote;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
-pub fn gen_grpc_impl(protos: &[impl AsRef<Path>], out_dir: impl Into<PathBuf>) -> Result<()> {
+pub fn gen_grpc_server_impl(protos: &[impl AsRef<Path>], out_dir: impl Into<PathBuf>) -> Result<()> {
     let output: PathBuf = out_dir.into();
     for proto in protos {
         let set = gen_file_descriptor(proto)?;
