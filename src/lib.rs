@@ -1,49 +1,117 @@
-mod ident;
 pub mod client;
+mod ident;
+pub mod server;
 
 use heck::SnakeCase;
 use ident::{to_snake, to_upper_camel};
-use proc_macro2::{Ident, TokenStream};
-use prost_types::FileDescriptorSet;
 use itertools::Itertools;
-use prost_build::protoc;
+use proc_macro2::{Ident, TokenStream};
 use prost::Message;
-use std::{ffi::OsStr, fs, path::{Path, PathBuf}, process::Command, str::FromStr};
+use prost_build::protoc;
+use prost_types::FileDescriptorSet;
 use quote::quote;
+use std::{
+    ffi::OsStr,
+    fs,
+    path::{Path, PathBuf},
+    process::Command,
+    str::FromStr,
+};
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
-pub fn gen_grpc_server_impl(protos: &[impl AsRef<Path>], out_dir: impl Into<PathBuf>) -> Result<()> {
+// type ServiceDescriptorProto = prost_types::ServiceDescriptorProto;
+// type MethodDescriptorProto = prost_types::MethodDescriptorProto;
+// 
+// trait MethodDescriptor {
+    // fn method_snake_cased(&self) -> String
+// }
+// 
+// impl crate::MethodDescriptorProto {
+    // fn method_snake_cased(&self) -> String {
+        // &self.name().to_snake_case()
+    // }
+// 
+    // fn request_message(&self, package: &str) -> String {
+        // get_req_or_ret(package, self.input_type()) 
+    // }
+// }
+
+pub struct GenProtoInfo {
+    trait_name: String,
+    method_name: String,
+    request_message_name: String,
+    response_message_name: String,
+    package_name: String,
+    grpc_handler_name: String,
+    server_name: String,
+    client_name: String,
+    server_mod_name: String,
+    client_mod_name: String
+}
+
+impl From<FileDescriptorSet> for GenProtoInfo {
+    fn from(set: FileDescriptorSet) -> Self {
+        let file = set.file[0].clone();
+        let service = set.file[0].service[0].clone();
+        let method = service.method[0].clone();
+        GenProtoInfo {
+            trait_name: service.name().to_string(),
+            method_name: method.name().to_snake_case(),
+            request_message_name: get_req_or_ret(file.package(), method.input_type()),
+            response_message_name: get_req_or_ret(file.package(), method.output_type()),
+            package_name: file.package().to_string(),
+            grpc_handler_name: "GrpcHandler".to_string(),
+            server_name: format!("{}Server", service.name()),
+            client_name: format!("{}Client", service.name()),
+            server_mod_name: format!("{}Server", service.name()).to_snake_case(),
+            client_mod_name: format!("{}Client", service.name()).to_snake_case()
+        }
+    }
+}
+
+pub fn generate(protos: &[impl AsRef<Path>], out_dir: impl Into<PathBuf>, server: bool, client: bool) -> Result<()> {
     let output: PathBuf = out_dir.into();
+    fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(output.join("grpc.rs"))?;
     for proto in protos {
         let set = gen_file_descriptor(proto)?;
-        let file = set.file[0].clone();
-        let mod_name = file.package();
-        let service = set.file[0].service[0].clone();
-        let trait_name = service.name().to_string();
-        let service_name = format!("{}Server", trait_name);
-        let server_mod = service_name.clone().to_snake_case();
-        let method = service.method[0].clone();
-        let fn_name = method.name().to_snake_case();
-        let input_type = method.input_type();
-        let req = get_req_or_ret(mod_name, input_type);
-        let output_type = method.output_type();
-        let ret = get_req_or_ret(mod_name, output_type);
-        let handler_name = "GrpcHandler".to_string();
+        let proto_info = GenProtoInfo::from(set);
         let mut buf = String::new();
-        generate(trait_name, fn_name, req, mod_name.to_string(), ret, handler_name, service_name, server_mod, &mut buf);
-        let file_name = output.join("grpc.rs");
-        fs::write(file_name.clone(), buf)?;
-        apply_rustfmt(file_name)?;
+        let package_ident = quote::format_ident!("{}", proto_info.package_name);
+        let proto_mod = format!("{}", gen_tonic_mod(package_ident.clone()));
+        buf.push_str(&proto_mod);
+        if server {
+            let server_code = server::generate_grpc_server_impl(&proto_info);
+            buf.push_str(&server_code);
+        }
+        if client {
+            let client_code = client::generate_grpc_client_impl(&proto_info);
+            buf.push_str(&client_code);
+        }
+        fs::write(output.join("grpc.rs"), buf)?;
+        apply_rustfmt(output.join("grpc.rs")).unwrap();
     }
     Ok(())
 }
 
+fn gen_tonic_mod(package_ident: Ident) -> TokenStream {
+    let mod_str = format!("\"{}\"", package_ident);
+    let mod_token = TokenStream::from_str(&mod_str).unwrap();
+    quote! {
+        pub mod #package_ident {
+            tonic::include_proto!(#mod_token);
+        }
+    }
+}
+
+
 fn apply_rustfmt(gen_file: impl AsRef<OsStr>) -> Result<()> {
     let mut cmd = Command::new("rustfmt");
-    cmd.arg("--edition")
-        .arg("2018")
-        .arg(gen_file);
+    cmd.arg("--edition").arg("2018").arg(gen_file);
     cmd.status()?;
     Ok(())
 }
@@ -55,7 +123,8 @@ fn gen_file_descriptor(proto_file: impl AsRef<Path>) -> Result<FileDescriptorSet
     let mut cmd = Command::new(protoc());
     cmd.arg("-o")
         .arg(&file_descriptor_set_path)
-        .arg("-I").arg(".")
+        .arg("-I")
+        .arg(".")
         .arg(proto_file.as_ref());
     cmd.status()?;
 
@@ -84,113 +153,21 @@ fn get_req_or_ret(package: &str, pb_ident: &str) -> String {
         .join("::")
 }
 
-fn generate(trait_name: String, fn_name: String, arg: String, mod_name: String, ret: String, handler_name: String, service_name: String, server_mod: String, buf: &mut String) {
-    let trait_ident = quote::format_ident!("{}", trait_name);
-    let fn_ident = quote::format_ident!("{}", fn_name);
-    let req_ident = quote::format_ident!("{}", arg);
-    let ret_ident = quote::format_ident!("{}", ret);
-    let handler_ident = quote::format_ident!("{}", handler_name);
-    let service_ident = quote::format_ident!("{}", service_name);
-    let mod_ident = quote::format_ident!("{}", mod_name);
-    let server_mod_ident = quote::format_ident!("{}", server_mod);
-    let trait_impl = gen_trait_impl(trait_ident, handler_ident.clone(), fn_ident, req_ident, ret_ident.clone(), mod_ident.clone(), server_mod_ident.clone());
-    let handler = gen_handler(handler_ident.clone());
-    let service_gen = gen_grpc_service(service_ident, handler_ident, mod_ident.clone(), server_mod_ident);
-    let proto_mod = gen_tonic_mod(mod_ident.clone());
-    let response_msg = gen_response_msg(mod_ident.clone(), ret_ident.clone());
-    let grpc_response = gen_grpc_response(mod_ident, ret_ident);
-    let code = quote! {
-        #proto_mod
-
-        #handler
-
-        #response_msg
-
-        #service_gen
-
-        #trait_impl
-
-        #grpc_response
-    };
-    let formatted_code = format!("{}", code);
-    buf.push_str(&formatted_code);
-}
-
-fn gen_tonic_mod(mod_ident: Ident) -> TokenStream {
-    let mod_str = format!("\"{}\"", mod_ident);
-    let mod_token = TokenStream::from_str(&mod_str).unwrap();
-    quote! {
-        pub mod #mod_ident {
-            tonic::include_proto!(#mod_token);
-        }
-    }
-}
-
-fn gen_trait_impl(trait_ident: Ident, handler_ident: Ident, fn_ident: Ident, req_ident: Ident, ret_ident: Ident, mod_ident: Ident, server_mod_ident: Ident) -> TokenStream {
-    let method_impl = gen_trait_methods_impl(fn_ident, req_ident, ret_ident, mod_ident.clone());
-    quote! {
-        #[tonic::async_trait]
-        impl #mod_ident::#server_mod_ident::#trait_ident for #handler_ident {
-            #method_impl 
-        } 
-    }
-}
-
-fn gen_trait_methods_impl(fn_ident: Ident, req_ident: Ident, ret_ident: Ident, mod_ident: Ident) -> TokenStream {
-    quote! {
-        async fn #fn_ident(
-            &self,
-            request: tonic::Request<#mod_ident::#req_ident>
-        ) -> Result<tonic::Response<#mod_ident::#ret_ident>, tonic::Status> {
-            println!("Got a request from {:?}", request.remote_addr());
-            let (response_tx, response_rx) = async_channel::bounded(100);
-            let msg = ResponseMsg {
-                addr: request.remote_addr().unwrap(),
-                response_tx
-            };
-            self.tx.send(msg).await.unwrap();
-            println!("Preparing response");
-            Ok(response_rx.recv().await.unwrap())
-        }
-    }
-}
-
-fn gen_response_msg(mod_ident: Ident, ret_ident: Ident) -> TokenStream {
-    quote! {
-        #[derive(Clone, Debug)]
-        pub struct ResponseMsg {
-            pub addr: std::net::SocketAddr,
-            pub response_tx: async_channel::Sender<tonic::Response<#mod_ident::#ret_ident>>
-        }
-    }
-}
-fn gen_handler(struct_name: Ident) -> TokenStream {
-    quote! {
-        #[derive(Clone, Debug)]
-        pub struct #struct_name {
-            tx: async_channel::Sender<ResponseMsg>,
-        }
-    }
-}
-
-fn gen_grpc_service(service_name: Ident, handler_name: Ident, mod_ident: Ident, server_mod_ident: Ident) -> TokenStream {
-    quote! {
-        pub fn get_grpc_service() -> (#mod_ident::#server_mod_ident::#service_name<#handler_name>, async_channel::Receiver<ResponseMsg>) {
-            let (tx, rx) = async_channel::bounded(100);
-            let handler = #handler_name {
-                tx,
-            };
-            let service = #mod_ident::#server_mod_ident::#service_name::new(handler);
-            (service, rx)
-        }
-    }
-}
-
-fn gen_grpc_response(mod_ident: Ident, ret_ident: Ident) -> TokenStream {
-    quote! {
-        pub fn get_grpc_response(value: tremor_value::Value) -> #mod_ident::#ret_ident {
-            let response: #mod_ident::#ret_ident = tremor_value::structurize(value).unwrap();
-            response
-        }
-    }
-}
+// fn gen_response_msg(mod_ident: Ident, ret_ident: Ident) -> TokenStream {
+    // quote! {
+        // #[derive(Clone, Debug)]
+        // pub struct ResponseMsg {
+            // pub addr: std::net::SocketAddr,
+            // pub response_tx: async_channel::Sender<tonic::Response<#mod_ident::#ret_ident>>
+        // }
+    // }
+// }
+// 
+// fn gen_grpc_response(mod_ident: Ident, ret_ident: Ident) -> TokenStream {
+    // quote! {
+        // pub fn get_grpc_response(value: tremor_value::Value) -> #mod_ident::#ret_ident {
+            // let response: #mod_ident::#ret_ident = tremor_value::structurize(value).unwrap();
+            // response
+        // }
+    // }
+// }
